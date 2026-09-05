@@ -20,8 +20,21 @@ import { authorizeConversation, validateBody, rateLimit, sendMessage } from './s
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** Wraps an async handler so a rejection reaches the error middleware. */
-const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+/**
+ * Wraps an async handler and answers the request itself on failure.
+ *
+ * Delegating to Express's error middleware proved unreliable inside Vercel's
+ * function runtime — a rejection there took down the whole invocation with an
+ * opaque FUNCTION_INVOCATION_FAILED instead of producing a response. Replying
+ * from inside the handler keeps every failure legible.
+ */
+const wrap = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch((err) => {
+    console.error(`[api] ${req.method} ${req.originalUrl}`, err);
+    if (res.headersSent) return;
+    if (err?.code === 'CONFIG') return res.status(503).json({ error: err.message });
+    res.status(500).json({ error: 'Something went wrong' });
+  });
 
 export function createRouter() {
   const router = Router();

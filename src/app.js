@@ -9,6 +9,24 @@ import { createRouter } from './routes.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, '..', 'public');
 
+/** Shown to visitors when the chat can't start — usually a missing database. */
+const UNAVAILABLE_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Support chat unavailable</title>
+<style>
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background:#0d1220; color:#e8ecf6; }
+  .card { max-width:420px; padding:32px; text-align:center; line-height:1.6; }
+  h1 { font-size:19px; margin:0 0 8px; }
+  p { color:#94a1bd; font-size:14px; margin:0; }
+</style></head>
+<body><div class="card">
+  <h1>Support chat is temporarily unavailable</h1>
+  <p>We couldn't start a conversation just now. Please try again in a few minutes.</p>
+</div></body></html>`;
+
 /** Builds the Express app. Used by the local server and the Vercel function. */
 export function createApp() {
   const app = express();
@@ -21,13 +39,15 @@ export function createApp() {
   app.use('/api', createRouter());
 
   // Customers never sign in: hitting the chat mints a guest session on the spot.
-  app.get(['/', '/chat'], async (req, res, next) => {
+  // A visitor must never see a stack trace, so this answers its own failures.
+  app.get(['/', '/chat'], async (req, res) => {
     try {
       if (req.user?.role === 'admin') return res.redirect('/admin');
       await ensureGuest(req, res);
       res.sendFile(join(PUBLIC_DIR, 'chat.html'));
     } catch (err) {
-      next(err);
+      console.error('[chat]', err);
+      if (!res.headersSent) res.status(503).type('html').send(UNAVAILABLE_PAGE);
     }
   });
 
