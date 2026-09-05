@@ -5,6 +5,8 @@
     form: document.getElementById('composer'),
     input: document.getElementById('input'),
     sendBtn: document.getElementById('send'),
+    attachBtn: document.getElementById('attach'),
+    fileInput: document.getElementById('file'),
   };
 
   const list = document.getElementById('conv-list');
@@ -69,9 +71,14 @@
     name.textContent = row.user_name;
     const preview = document.createElement('div');
     preview.className = 'conv-preview';
+    // An image-only message stores an empty body, so last_role is what tells
+    // us a message exists at all.
+    const prefix = row.last_role === 'admin' ? 'You: ' : '';
     preview.textContent = row.last_body
-      ? `${row.last_role === 'admin' ? 'You: ' : ''}${row.last_body}`
-      : 'No messages yet';
+      ? `${prefix}${row.last_body}`
+      : row.last_role
+        ? `${prefix}📷 Photo`
+        : 'No messages yet';
     middle.append(name, preview);
 
     const side = document.createElement('div');

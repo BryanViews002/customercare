@@ -32,7 +32,27 @@ export function createApp() {
   const app = express();
 
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '64kb' }));
+
+  // Image uploads arrive as a raw binary body; everything else is JSON.
+  // Both parsers answer their own failures: a malformed body or an oversized
+  // upload must never reach the error middleware, which is unreliable inside
+  // Vercel's function runtime.
+  const parsers = [
+    express.raw({ type: ['image/*'], limit: '4mb' }),
+    express.json({ limit: '64kb' }),
+  ];
+  for (const parse of parsers) {
+    app.use((req, res, next) =>
+      parse(req, res, (err) => {
+        if (!err) return next();
+        console.error('[body]', err.type ?? err.message);
+        const tooBig = err.type === 'entity.too.large';
+        res.status(tooBig ? 413 : 400).json({
+          error: tooBig ? 'That upload is too large' : 'Malformed request body',
+        });
+      })
+    );
+  }
   app.use(cookieParser());
   app.use(attachUser);
 

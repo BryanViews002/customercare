@@ -106,6 +106,21 @@ const SCHEMA = `
     created_at      BIGINT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, created_at);
+
+  -- Images live in the database rather than a public bucket: every thread is
+  -- private, so bytes are only ever served through an authorized route.
+  CREATE TABLE IF NOT EXISTS attachments (
+    id              TEXT PRIMARY KEY,
+    message_id      TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    mime            TEXT NOT NULL,
+    width           INTEGER,
+    height          INTEGER,
+    byte_size       INTEGER NOT NULL,
+    data            BYTEA NOT NULL,
+    created_at      BIGINT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_att_msg ON attachments(message_id);
 `;
 
 /** Resolves to a ready client: connected, migrated, admin seeded. */
@@ -338,6 +353,16 @@ export const conversations = {
 
 /* -------------------------------------------------------------- messages -- */
 
+/** Message columns plus its optional image — never the image bytes. */
+const MESSAGE_SELECT = `
+  SELECT m.*, u.name AS sender_name,
+         a.id AS attachment_id, a.mime AS attachment_mime,
+         a.width AS attachment_width, a.height AS attachment_height,
+         a.byte_size AS attachment_bytes
+  FROM messages m
+  JOIN users u ON u.id = m.sender_id
+  LEFT JOIN attachments a ON a.message_id = m.id`;
+
 export const messages = {
   async create({ conversationId, senderId, senderRole, body }) {
     const id = randomUUID();
@@ -352,27 +377,21 @@ export const messages = {
   },
 
   byId(id) {
-    return one(
-      `SELECT m.*, u.name AS sender_name FROM messages m
-       JOIN users u ON u.id = m.sender_id WHERE m.id = $1`,
-      [id]
-    );
+    return one(`${MESSAGE_SELECT} WHERE m.id = $1`, [id]);
   },
 
   /** Page backwards through history: pass the oldest message id you hold. */
   async history(conversationId, { before = null, limit = 50 } = {}) {
     const rows = before
       ? await all(
-          `SELECT m.*, u.name AS sender_name FROM messages m
-           JOIN users u ON u.id = m.sender_id
+          `${MESSAGE_SELECT}
            WHERE m.conversation_id = $1
              AND m.created_at < (SELECT created_at FROM messages WHERE id = $2)
            ORDER BY m.created_at DESC LIMIT $3`,
           [conversationId, before, limit]
         )
       : await all(
-          `SELECT m.*, u.name AS sender_name FROM messages m
-           JOIN users u ON u.id = m.sender_id
+          `${MESSAGE_SELECT}
            WHERE m.conversation_id = $1
            ORDER BY m.created_at DESC LIMIT $2`,
           [conversationId, limit]
@@ -383,11 +402,36 @@ export const messages = {
   /** Everything newer than `after` — the heart of the polling loop. */
   since(conversationId, after) {
     return all(
-      `SELECT m.*, u.name AS sender_name FROM messages m
-       JOIN users u ON u.id = m.sender_id
+      `${MESSAGE_SELECT}
        WHERE m.conversation_id = $1 AND m.created_at > $2
        ORDER BY m.created_at ASC LIMIT 200`,
       [conversationId, after]
+    );
+  },
+};
+
+/* ----------------------------------------------------------- attachments -- */
+
+export const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+export const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+export const attachments = {
+  async create({ messageId, conversationId, mime, width, height, data }) {
+    const id = randomUUID();
+    await query(
+      `INSERT INTO attachments
+         (id, message_id, conversation_id, mime, width, height, byte_size, data, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [id, messageId, conversationId, mime, width ?? null, height ?? null, data.length, data, Date.now()]
+    );
+    return id;
+  },
+
+  /** Bytes plus the owning conversation, so the caller can authorize first. */
+  byId(id) {
+    return one(
+      'SELECT id, conversation_id, mime, byte_size, data FROM attachments WHERE id = $1',
+      [id]
     );
   },
 };
@@ -405,4 +449,13 @@ export const publicMessage = (m) =>
     senderName: m.sender_name,
     body: m.body,
     createdAt: Number(m.created_at),
+    attachment: m.attachment_id
+      ? {
+          id: m.attachment_id,
+          mime: m.attachment_mime,
+          width: m.attachment_width ? Number(m.attachment_width) : null,
+          height: m.attachment_height ? Number(m.attachment_height) : null,
+          bytes: Number(m.attachment_bytes),
+        }
+      : null,
   };

@@ -22,6 +22,9 @@
         <div class="typing" id="typing"></div>
 
         <form class="composer" id="composer">
+          <input type="file" id="file" accept="image/*" hidden />
+          <button class="attach" id="attach" type="button" title="Attach an image"
+                  aria-label="Attach an image">&#128206;</button>
           <textarea id="input" rows="1" placeholder="Write a message…" maxlength="4000"></textarea>
           <button class="send" id="send" type="submit">Send</button>
         </form>

@@ -1,4 +1,4 @@
-import { conversations, messages, publicMessage } from './db.js';
+import { conversations, messages, attachments, publicMessage } from './db.js';
 
 export const MAX_BODY = 4000;
 
@@ -16,10 +16,14 @@ export async function authorizeConversation(user, conversationId) {
   return { conversation };
 }
 
-export function validateBody(raw) {
+/** A message needs text, unless it carries an image — then a caption is optional. */
+export function validateBody(raw, { allowEmpty = false } = {}) {
+  if (raw === undefined || raw === null) {
+    return allowEmpty ? { body: '' } : { error: 'Message is empty' };
+  }
   if (typeof raw !== 'string') return { error: 'Message must be text' };
   const body = raw.trim();
-  if (!body) return { error: 'Message is empty' };
+  if (!body && !allowEmpty) return { error: 'Message is empty' };
   if (body.length > MAX_BODY) return { error: `Message exceeds ${MAX_BODY} characters` };
   return { body };
 }
@@ -45,15 +49,31 @@ export function rateLimit(userId, limit = 20, windowMs = 10_000) {
   return true;
 }
 
-/** Persists a message and marks the sender's own side as caught up. */
-export async function sendMessage({ conversation, sender, body }) {
-  const message = await messages.create({
+/**
+ * Persists a message — optionally with one image — and marks the sender's own
+ * side as caught up. The attachment is written after the message so it can
+ * reference it; the row is re-read so the caller gets the joined shape.
+ */
+export async function sendMessage({ conversation, sender, body, image = null }) {
+  const created = await messages.create({
     conversationId: conversation.id,
     senderId: sender.id,
     senderRole: sender.role,
     body,
   });
+
+  if (image) {
+    await attachments.create({
+      messageId: created.id,
+      conversationId: conversation.id,
+      mime: image.mime,
+      width: image.width,
+      height: image.height,
+      data: image.data,
+    });
+  }
+
   await conversations.markRead(conversation.id, sender.role);
   await conversations.markTyping(conversation.id, sender.role, false);
-  return publicMessage(message);
+  return publicMessage(image ? await messages.byId(created.id) : created);
 }

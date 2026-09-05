@@ -5,6 +5,8 @@
     form: document.getElementById('composer'),
     input: document.getElementById('input'),
     sendBtn: document.getElementById('send'),
+    attachBtn: document.getElementById('attach'),
+    fileInput: document.getElementById('file'),
   };
   const subhead = document.getElementById('subhead');
 

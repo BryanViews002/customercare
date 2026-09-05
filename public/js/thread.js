@@ -77,10 +77,14 @@ window.createThread = function createThread({ me, els, emptyState, onUpdate }) {
       }
     }
 
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    bubble.textContent = message.body;
-    wrap.append(bubble);
+    if (message.attachment) wrap.append(imageBubble(message.attachment));
+
+    if (message.body) {
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = message.body;
+      wrap.append(bubble);
+    }
 
     const meta = document.createElement('div');
     meta.className = 'meta';
@@ -88,6 +92,50 @@ window.createThread = function createThread({ me, els, emptyState, onUpdate }) {
     wrap.append(meta);
 
     return wrap;
+  }
+
+  /** Image bubble, sized ahead of load so the thread doesn't jump. */
+  function imageBubble(attachment) {
+    const figure = document.createElement('button');
+    figure.type = 'button';
+    figure.className = 'image-bubble';
+    figure.title = 'Open full size';
+
+    const img = document.createElement('img');
+    img.src = `/api/attachments/${attachment.id}`;
+    img.alt = 'Shared image';
+    // Not lazy: inside this scrolling, re-rendered container the browser often
+    // never decides the image is visible, and it stays permanently unloaded.
+    img.decoding = 'async';
+    if (attachment.width && attachment.height) {
+      img.width = attachment.width;
+      img.height = attachment.height;
+      figure.style.aspectRatio = `${attachment.width} / ${attachment.height}`;
+    }
+    figure.append(img);
+    figure.addEventListener('click', () => lightbox(img.src));
+    return figure;
+  }
+
+  /** Full-size overlay; click or Escape closes it. */
+  function lightbox(src) {
+    const overlay = document.createElement('div');
+    overlay.className = 'lightbox';
+    const full = document.createElement('img');
+    full.src = src;
+    full.alt = 'Shared image, full size';
+    overlay.append(full);
+
+    const close = () => {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+    };
+    const onKey = (event) => {
+      if (event.key === 'Escape') close();
+    };
+    overlay.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+    document.body.append(overlay);
   }
 
   function render() {
@@ -248,6 +296,164 @@ window.createThread = function createThread({ me, els, emptyState, onUpdate }) {
     }
   }
 
+  /* -------------------------------------------------------------- images -- */
+
+  const MAX_EDGE = 1600;
+  const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
+
+  /**
+   * Shrinks a photo before it leaves the browser: a phone camera image is
+   * several megabytes, which serverless request limits won't carry and the
+   * database shouldn't hold. Screenshots usually pass through untouched.
+   */
+  async function prepareImage(file) {
+    if (!file.type.startsWith('image/')) throw new Error('Only images can be attached');
+    // GIFs would lose their animation on a canvas round-trip, so send as-is.
+    if (file.type === 'image/gif') {
+      if (file.size > MAX_UPLOAD_BYTES) throw new Error('That GIF is too large (3 MB maximum)');
+      return { blob: file, mime: file.type, width: null, height: null };
+    }
+
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+    const width = Math.round(bitmap.width * scale);
+    const height = Math.round(bitmap.height * scale);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height);
+    bitmap.close?.();
+
+    // PNG screenshots stay PNG unless that ends up bigger than JPEG would be.
+    const mime = file.type === 'image/png' && file.size < 900_000 ? 'image/png' : 'image/jpeg';
+    const blob = await new Promise((resolve) =>
+      canvas.toBlob(resolve, mime, mime === 'image/jpeg' ? 0.82 : undefined)
+    );
+    if (!blob) throw new Error('Could not read that image');
+    if (blob.size > MAX_UPLOAD_BYTES) throw new Error('That image is too large (3 MB maximum)');
+    return { blob, mime, width, height };
+  }
+
+  async function sendImage(file) {
+    let prepared;
+    try {
+      prepared = await prepareImage(file);
+    } catch (err) {
+      flashError(err.message);
+      return;
+    }
+
+    const caption = els.input.value.trim();
+    els.input.value = '';
+    els.input.style.height = 'auto';
+    stopTyping();
+
+    const previewUrl = URL.createObjectURL(prepared.blob);
+    const node = optimisticImage(previewUrl, caption);
+
+    try {
+      const res = await fetch(`/api/conversations/${state.conversationId}/attachments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': prepared.mime,
+          ...(caption ? { 'X-Caption': btoa(unescape(encodeURIComponent(caption))) } : {}),
+          ...(prepared.width ? { 'X-Image-Width': String(prepared.width) } : {}),
+          ...(prepared.height ? { 'X-Image-Height': String(prepared.height) } : {}),
+        },
+        body: prepared.blob,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+      node.remove();
+      absorb([data.message]);
+      render();
+      scrollToBottom();
+    } catch (err) {
+      node.classList.remove('pending');
+      node.classList.add('failed');
+      node.querySelector('.meta').textContent = err.message;
+    } finally {
+      URL.revokeObjectURL(previewUrl);
+    }
+  }
+
+  function optimisticImage(url, caption) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg out pending start';
+
+    const figure = document.createElement('div');
+    figure.className = 'image-bubble';
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = '';
+    figure.append(img);
+    wrap.append(figure);
+
+    if (caption) {
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = caption;
+      wrap.append(bubble);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = 'Sending…';
+    wrap.append(meta);
+
+    els.messages.querySelector('.empty-state')?.remove();
+    els.messages.append(wrap);
+    scrollToBottom();
+    return wrap;
+  }
+
+  function flashError(text) {
+    els.typing.textContent = text;
+    setTimeout(() => {
+      if (els.typing.textContent === text) els.typing.textContent = '';
+    }, 4000);
+  }
+
+  const firstImage = (items) =>
+    [...(items ?? [])].map((i) => (i.kind === 'file' ? i.getAsFile() : null)).find((f) => f?.type?.startsWith('image/'));
+
+  if (els.attachBtn && els.fileInput) {
+    els.attachBtn.addEventListener('click', () => els.fileInput.click());
+    els.fileInput.addEventListener('change', () => {
+      const file = els.fileInput.files?.[0];
+      if (file) sendImage(file);
+      els.fileInput.value = ''; // let the same file be picked again
+    });
+  }
+
+  // Pasting a screenshot straight into the composer is the common case.
+  els.input.addEventListener('paste', (event) => {
+    const file = firstImage(event.clipboardData?.items);
+    if (file) {
+      event.preventDefault();
+      sendImage(file);
+    }
+  });
+
+  const dropZone = els.dropZone ?? els.messages;
+  dropZone.addEventListener('dragover', (event) => {
+    if (event.dataTransfer?.types?.includes('Files')) {
+      event.preventDefault();
+      dropZone.classList.add('dropping');
+    }
+  });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dropping'));
+  dropZone.addEventListener('drop', (event) => {
+    dropZone.classList.remove('dropping');
+    const file = firstImage(event.dataTransfer?.items);
+    if (file) {
+      event.preventDefault();
+      sendImage(file);
+    }
+  });
+
   /* ------------------------------------------------------------- typing -- */
 
   function pushTyping(isTyping) {
@@ -307,6 +513,7 @@ window.createThread = function createThread({ me, els, emptyState, onUpdate }) {
   function setComposerEnabled(enabled, reason) {
     els.input.disabled = !enabled;
     els.sendBtn.disabled = !enabled;
+    if (els.attachBtn) els.attachBtn.disabled = !enabled;
     els.input.placeholder = enabled ? 'Write a message…' : reason || 'Conversation closed';
   }
 

@@ -3,10 +3,13 @@ import {
   users,
   conversations,
   messages,
+  attachments,
   publicUser,
   publicMessage,
   TYPING_WINDOW_MS,
   PRESENCE_WINDOW_MS,
+  MAX_IMAGE_BYTES,
+  ALLOWED_IMAGE_TYPES,
 } from './db.js';
 import {
   verifyPassword,
@@ -19,6 +22,16 @@ import {
 import { authorizeConversation, validateBody, rateLimit, sendMessage } from './service.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Captions travel base64-encoded so a header can carry any character. */
+function decodeCaption(raw) {
+  if (!raw) return '';
+  try {
+    return Buffer.from(String(raw), 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+}
 
 /**
  * Wraps an async handler and answers the request itself on failure.
@@ -225,6 +238,73 @@ export function createRouter() {
       res.status(201).json({
         message: await sendMessage({ conversation, sender: req.user, body: check.body }),
       });
+    })
+  );
+
+  /* -------------------------------------------------------- attachments -- */
+
+  /**
+   * Upload one image as a message. The body is the raw image; an optional
+   * caption rides along in the X-Caption header so the payload stays binary.
+   */
+  router.post(
+    '/conversations/:id/attachments',
+    requireAuth,
+    wrap(async (req, res) => {
+      const { conversation, error, status } = await authorizeConversation(req.user, req.params.id);
+      if (error) return res.status(status).json({ error });
+      if (conversation.status === 'closed' && req.user.role !== 'admin') {
+        return res.status(409).json({ error: 'This conversation is closed' });
+      }
+
+      const mime = String(req.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      if (!ALLOWED_IMAGE_TYPES.includes(mime)) {
+        return res.status(415).json({ error: 'Only JPEG, PNG, WebP and GIF images are supported' });
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: 'No image received' });
+      }
+      if (req.body.length > MAX_IMAGE_BYTES) {
+        return res.status(413).json({ error: 'Image is too large (3 MB maximum)' });
+      }
+      if (!rateLimit(req.user.id)) return res.status(429).json({ error: 'Slow down a moment' });
+
+      const caption = validateBody(decodeCaption(req.get('x-caption')), { allowEmpty: true });
+      if (caption.error) return res.status(400).json({ error: caption.error });
+
+      res.status(201).json({
+        message: await sendMessage({
+          conversation,
+          sender: req.user,
+          body: caption.body,
+          image: {
+            mime,
+            width: Number(req.get('x-image-width')) || null,
+            height: Number(req.get('x-image-height')) || null,
+            data: req.body,
+          },
+        }),
+      });
+    })
+  );
+
+  /** Serves image bytes, but only to the two sides of that conversation. */
+  router.get(
+    '/attachments/:id',
+    requireAuth,
+    wrap(async (req, res) => {
+      const attachment = await attachments.byId(req.params.id);
+      if (!attachment) return res.status(404).json({ error: 'Not found' });
+
+      const { error, status } = await authorizeConversation(req.user, attachment.conversation_id);
+      if (error) return res.status(status).json({ error });
+
+      const data = Buffer.isBuffer(attachment.data) ? attachment.data : Buffer.from(attachment.data);
+      res.set('Content-Type', attachment.mime);
+      res.set('Content-Length', String(data.length));
+      // Private: an image must never be cached by a shared proxy.
+      res.set('Cache-Control', 'private, max-age=86400');
+      res.send(data);
     })
   );
 

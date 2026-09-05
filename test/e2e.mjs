@@ -112,6 +112,50 @@ const { body: receipt } = await json(
 );
 check('guest sees the agent has read the thread', receipt.peerReadAt > 0, `peerReadAt=${receipt.peerReadAt}`);
 
+// 6b. Images: the guest sends one, the agent can fetch it back.
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFklEQVR4nGP8//8/AzJgYkAD' +
+    'IyIAAFdvAxED4wLKAAAAAElFTkSuQmCC',
+  'base64'
+);
+
+const upRes = await fetch(`${BASE}/api/conversations/${conversationId}/attachments`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'image/png',
+    'X-Image-Width': '2',
+    'X-Image-Height': '2',
+    'X-Caption': Buffer.from('Here is the receipt', 'utf8').toString('base64'),
+    cookie: guestCookie,
+  },
+  body: PNG,
+});
+const upBody = await upRes.json().catch(() => ({}));
+const attachmentId = upBody.message?.attachment?.id;
+check('guest can upload an image', upRes.status === 201 && Boolean(attachmentId), JSON.stringify(upBody).slice(0, 120));
+check('image message keeps its caption', upBody.message?.body === 'Here is the receipt');
+check('attachment reports its dimensions', upBody.message?.attachment?.width === 2);
+
+const imgRes = await get(`/api/attachments/${attachmentId}`, adminCookie);
+const imgBytes = Buffer.from(await imgRes.arrayBuffer());
+check('agent can fetch the image', imgRes.status === 200 && imgBytes.length === PNG.length);
+check('image is served with its own content type', imgRes.headers.get('content-type') === 'image/png');
+check('image is not cached by shared proxies', /private/.test(imgRes.headers.get('cache-control') ?? ''));
+
+const badType = await fetch(`${BASE}/api/conversations/${conversationId}/attachments`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/pdf', cookie: guestCookie },
+  body: 'not an image',
+});
+check('non-image uploads are rejected', badType.status === 415, `status=${badType.status}`);
+
+const badJson = await fetch(`${BASE}/api/conversations/${conversationId}/messages`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', cookie: guestCookie },
+  body: '{not json',
+});
+check('a malformed body gets 400, not a crash', badJson.status === 400, `status=${badJson.status}`);
+
 // 7. Privacy: a second visitor must not reach the first one's thread.
 const otherCookie = cookieOf(await get('/'));
 check('second visitor gets a distinct session', otherCookie && otherCookie !== guestCookie);
@@ -128,6 +172,12 @@ check('other visitor cannot post into it', writeAttempt.status === 403, `status=
 
 const { res: readAttempt } = await json(`/api/conversations/${conversationId}/messages`, otherCookie);
 check('REST history is blocked for other visitors', readAttempt.status === 403, `status=${readAttempt.status}`);
+
+const strangerImage = await get(`/api/attachments/${attachmentId}`, otherCookie);
+check('other visitor cannot fetch the image', strangerImage.status === 403, `status=${strangerImage.status}`);
+
+const anonImage = await get(`/api/attachments/${attachmentId}`, null);
+check('signed-out requests cannot fetch the image', anonImage.status === 401, `status=${anonImage.status}`);
 
 const { res: adminGuard } = await json('/api/admin/conversations', guestCookie);
 check('guests cannot read the agent inbox', adminGuard.status === 403, `status=${adminGuard.status}`);

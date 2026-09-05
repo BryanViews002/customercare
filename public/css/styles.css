@@ -284,6 +284,71 @@ input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft
 
 .meta { font-size: 11px; color: var(--muted); margin-top: 3px; padding: 0 4px; }
 
+/* ------------------------------------------------------------- images -- */
+
+.image-bubble {
+  display: block;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--bubble-in);
+  cursor: zoom-in;
+  max-width: 280px;
+  line-height: 0;
+}
+
+.msg.out .image-bubble { border-bottom-right-radius: 5px; }
+.msg.in .image-bubble { border-bottom-left-radius: 5px; }
+.msg .image-bubble + .bubble { margin-top: 4px; }
+
+.image-bubble img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 320px;
+  object-fit: cover;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgba(6, 10, 20, 0.88);
+  cursor: zoom-out;
+}
+
+.lightbox img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.attach {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.attach:hover:not(:disabled) { border-color: var(--brand); background: var(--brand-soft); }
+.attach:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.messages.dropping {
+  outline: 2px dashed var(--brand);
+  outline-offset: -10px;
+  background: var(--brand-soft);
+}
+
 .system-note {
   align-self: center;
   font-size: 12.5px;
