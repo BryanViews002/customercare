@@ -26,6 +26,33 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 export function createRouter() {
   const router = Router();
 
+  /**
+   * Diagnostics that never throw: says whether the function booted, what
+   * database it thinks it has, and why a connection failed if it did.
+   */
+  router.get('/health', async (_req, res) => {
+    const report = {
+      ok: true,
+      runtime: process.version,
+      onVercel: Boolean(process.env.VERCEL),
+      hasPostgresUrl: Boolean(process.env.POSTGRES_URL || process.env.DATABASE_URL),
+      hasAdminEnv: Boolean(process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD),
+    };
+    try {
+      const { db } = await import('./db.js');
+      const client = await db();
+      const result = await client.query('SELECT COUNT(*) AS n FROM conversations');
+      report.database = 'connected';
+      report.conversations = Number(result.rows[0].n);
+    } catch (err) {
+      report.ok = false;
+      report.database = 'unavailable';
+      report.error = String(err?.message ?? err).slice(0, 300);
+      report.errorCode = err?.code ?? null;
+    }
+    res.status(report.ok ? 200 : 503).json(report);
+  });
+
   /* ------------------------------------------------ agent sign-in only -- */
 
   router.post(
