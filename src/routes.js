@@ -48,6 +48,7 @@ export function createRouter() {
       ok: true,
       runtime: process.version,
       onVercel: Boolean(process.env.VERCEL),
+      commit: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? 'local',
       hasPostgresUrl: Boolean(process.env.POSTGRES_URL || process.env.DATABASE_URL),
       hasAdminEnv: Boolean(process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD),
     };
