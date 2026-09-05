@@ -18,13 +18,12 @@
     'I can’t sign in to my account',
   ];
 
-  const meRes = await fetch('/api/me').then((r) => r.json());
-  // The page itself mints the guest session, so a missing user means the
+  const opened = await fetch('/api/my/conversation').then((r) => r.json());
+  // The page itself mints the guest session, so a missing thread means the
   // cookie was blocked — a reload through the server route is the fix.
-  if (!meRes.user) return window.location.reload();
-  const me = meRes.user;
+  if (!opened.conversation) return window.location.reload();
 
-  const socket = io();
+  const me = opened.conversation.customer;
 
   /** Welcome panel: a greeting plus one-tap versions of the usual questions. */
   function welcome() {
@@ -52,28 +51,17 @@
     return wrap;
   }
 
-  const thread = window.createThread({ socket, me, els, emptyState: welcome });
-
-  socket.on('ready', () => {
-    socket.emit('conversation:join', {}, (reply) => {
-      if (reply?.error) {
-        els.messages.textContent = reply.error;
-        return;
-      }
-      thread.load(reply);
-      applyStatus(reply.conversation.status);
-    });
+  const thread = window.createThread({
+    me,
+    els,
+    emptyState: welcome,
+    onUpdate: ({ status }) => {
+      if (status) applyStatus(status);
+    },
   });
 
-  socket.on('conversation:updated', (patch) => {
-    if (patch.id !== thread.conversationId) return;
-    thread.setStatus(patch.status);
-    applyStatus(patch.status);
-  });
-
-  // The status line stays empty unless something is actually wrong.
-  socket.on('disconnect', () => (subhead.textContent = 'Reconnecting…'));
-  socket.on('connect', () => (subhead.textContent = ''));
+  thread.load(opened);
+  applyStatus(opened.conversation.status);
 
   function applyStatus(status) {
     const closed = status === 'closed';
@@ -81,6 +69,7 @@
       !closed,
       'This conversation was marked resolved. Start a new message to reopen it.'
     );
+    subhead.textContent = '';
     document.title = closed ? 'Support chat (resolved)' : 'Support chat';
   }
 })();

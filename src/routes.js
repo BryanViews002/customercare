@@ -1,5 +1,13 @@
 import { Router } from 'express';
-import { users, conversations, messages, publicUser, publicMessage } from './db.js';
+import {
+  users,
+  conversations,
+  messages,
+  publicUser,
+  publicMessage,
+  TYPING_WINDOW_MS,
+  PRESENCE_WINDOW_MS,
+} from './db.js';
 import {
   verifyPassword,
   startSession,
@@ -8,146 +16,240 @@ import {
   requireAuth,
   requireAdmin,
 } from './auth.js';
-import { authorizeConversation, validateBody, rateLimit } from './service.js';
+import { authorizeConversation, validateBody, rateLimit, sendMessage } from './service.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export function createRouter(service) {
+/** Wraps an async handler so a rejection reaches the error middleware. */
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+export function createRouter() {
   const router = Router();
 
   /* ------------------------------------------------ agent sign-in only -- */
 
-  router.post('/auth/agent-login', async (req, res) => {
-    const email = String(req.body?.email ?? '').trim().toLowerCase();
-    const password = String(req.body?.password ?? '');
-    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+  router.post(
+    '/auth/agent-login',
+    wrap(async (req, res) => {
+      const email = String(req.body?.email ?? '').trim().toLowerCase();
+      const password = String(req.body?.password ?? '');
+      if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter a valid email address' });
 
-    const user = users.byEmail(email);
-    // One response for unknown email, wrong password, and non-agent accounts.
-    if (!user || user.role !== 'admin' || !user.password || !(await verifyPassword(password, user.password))) {
-      return res.status(401).json({ error: 'Incorrect email or password' });
-    }
-    dropSession(req); // retire any guest session this browser was carrying
-    startSession(res, user.id);
-    res.json({ user: publicUser(user) });
-  });
+      const user = await users.byEmail(email);
+      // One response for unknown email, wrong password, and non-agent accounts.
+      if (
+        !user ||
+        user.role !== 'admin' ||
+        !user.password ||
+        !(await verifyPassword(password, user.password))
+      ) {
+        return res.status(401).json({ error: 'Incorrect email or password' });
+      }
+      await dropSession(req); // retire any guest session this browser was carrying
+      await startSession(res, user.id);
+      res.json({ user: publicUser(user) });
+    })
+  );
 
-  router.post('/auth/logout', (req, res) => {
-    endSession(req, res);
-    res.json({ ok: true });
-  });
+  router.post(
+    '/auth/logout',
+    wrap(async (req, res) => {
+      await endSession(req, res);
+      res.json({ ok: true });
+    })
+  );
 
-  router.get('/me', (req, res) => {
-    if (!req.user) return res.json({ user: null });
-    res.json({
-      user: publicUser(req.user),
-      unread:
-        req.user.role === 'admin'
-          ? conversations.list({ limit: 500 }).reduce((n, c) => n + c.unread, 0)
-          : conversations.unreadForUser(req.user.id),
-    });
-  });
+  router.get(
+    '/me',
+    wrap(async (req, res) => {
+      if (!req.user) return res.json({ user: null });
+      res.json({ user: publicUser(req.user) });
+    })
+  );
 
   /** Visitors can put a real name on their thread so agents know who they are. */
-  router.patch('/me', requireAuth, (req, res) => {
-    const name = String(req.body?.name ?? '').trim().slice(0, 60);
-    if (name.length < 2) return res.status(400).json({ error: 'Name is too short' });
-    const user = users.rename(req.user.id, name);
-    const conversation = conversations.ensureFor(user.id);
-    service.announceConversation(conversation.id);
-    res.json({ user: publicUser(user) });
-  });
+  router.patch(
+    '/me',
+    requireAuth,
+    wrap(async (req, res) => {
+      const name = String(req.body?.name ?? '').trim().slice(0, 60);
+      if (name.length < 2) return res.status(400).json({ error: 'Name is too short' });
+      res.json({ user: publicUser(await users.rename(req.user.id, name)) });
+    })
+  );
 
-  /* ------------------------------------------------------- my thread -- */
+  /* --------------------------------------------------- customer thread -- */
 
-  router.get('/my/conversation', requireAuth, (req, res) => {
-    if (req.user.role === 'admin') {
-      return res.status(400).json({ error: 'Admins use the support inbox' });
-    }
-    const conversation = conversations.ensureFor(req.user.id);
-    conversations.markRead(conversation.id, 'user');
-    res.json({
-      conversation: {
-        id: conversation.id,
-        subject: conversation.subject,
-        status: conversation.status,
-        updatedAt: conversation.updated_at,
-      },
-      messages: messages.history(conversation.id, { limit: 50 }).map(publicMessage),
-    });
-  });
-
-  /* --------------------------------------------------------- history -- */
-
-  router.get('/conversations/:id/messages', requireAuth, (req, res) => {
-    const { conversation, error, status } = authorizeConversation(req.user, req.params.id);
-    if (error) return res.status(status).json({ error });
-    const before = req.query.before ? String(req.query.before) : null;
-    const limit = Math.min(Number(req.query.limit) || 50, 100);
-    res.json({ messages: messages.history(conversation.id, { before, limit }).map(publicMessage) });
-  });
-
-  /** REST fallback for sending — the socket path is preferred. */
-  router.post('/conversations/:id/messages', requireAuth, (req, res) => {
-    const { conversation, error, status } = authorizeConversation(req.user, req.params.id);
-    if (error) return res.status(status).json({ error });
-    if (conversation.status === 'closed' && req.user.role !== 'admin') {
-      return res.status(409).json({ error: 'This conversation is closed' });
-    }
-    const check = validateBody(req.body?.body);
-    if (check.error) return res.status(400).json({ error: check.error });
-    if (!rateLimit(req.user.id)) return res.status(429).json({ error: 'Slow down a moment' });
-
-    res.status(201).json({ message: service.send({ conversation, sender: req.user, body: check.body }) });
-  });
-
-  /* --------------------------------------------------- admin console -- */
-
-  router.get('/admin/conversations', requireAdmin, (req, res) => {
-    res.json({
-      conversations: conversations.list({
-        status: String(req.query.status ?? 'all'),
-        q: String(req.query.q ?? '').trim(),
-        limit: Math.min(Number(req.query.limit) || 100, 200),
-      }),
-    });
-  });
-
-  router.get('/admin/conversations/:id', requireAdmin, (req, res) => {
-    const conversation = conversations.byId(req.params.id);
-    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
-    conversations.markRead(conversation.id, 'admin');
-    const customer = users.byId(conversation.user_id);
-    res.json({
-      conversation: {
-        id: conversation.id,
-        subject: conversation.subject,
-        status: conversation.status,
-        updatedAt: conversation.updated_at,
-        customer: publicUser(customer),
-        customerLastSeen: customer?.last_seen_at ?? null,
-      },
-      messages: messages.history(conversation.id, { limit: 50 }).map(publicMessage),
-    });
-  });
-
-  router.patch('/admin/conversations/:id', requireAdmin, (req, res) => {
-    const conversation = conversations.byId(req.params.id);
-    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
-
-    if (req.body?.status !== undefined) {
-      if (!['open', 'closed'].includes(req.body.status)) {
-        return res.status(400).json({ error: 'Status must be open or closed' });
+  router.get(
+    '/my/conversation',
+    requireAuth,
+    wrap(async (req, res) => {
+      if (req.user.role === 'admin') {
+        return res.status(400).json({ error: 'Agents use the support inbox' });
       }
-      conversations.setStatus(conversation.id, req.body.status);
-    }
-    if (req.body?.subject !== undefined) {
-      const subject = String(req.body.subject).trim().slice(0, 120);
-      if (!subject) return res.status(400).json({ error: 'Subject cannot be empty' });
-      conversations.setSubject(conversation.id, subject);
-    }
-    res.json({ conversation: service.announceConversation(conversation.id) });
-  });
+      const conversation = await conversations.ensureFor(req.user.id);
+      await conversations.markRead(conversation.id, 'user');
+      res.json({
+        conversation: {
+          id: conversation.id,
+          subject: conversation.subject,
+          status: conversation.status,
+          customer: publicUser(req.user),
+        },
+        messages: (await messages.history(conversation.id, { limit: 50 })).map(publicMessage),
+        supportOnline: await conversations.supportOnline(),
+      });
+    })
+  );
+
+  /* ------------------------------------------------------------ polling -- */
+
+  /**
+   * The whole realtime layer, in one request. The client calls this every few
+   * seconds with the timestamp of the newest message it holds and gets back
+   * anything newer plus the peer's typing/read state.
+   */
+  router.get(
+    '/conversations/:id/poll',
+    requireAuth,
+    wrap(async (req, res) => {
+      const { conversation, error, status } = await authorizeConversation(req.user, req.params.id);
+      if (error) return res.status(status).json({ error });
+
+      const after = Number(req.query.after) || 0;
+      const fresh = (await messages.since(conversation.id, after)).map(publicMessage);
+
+      // Seeing the thread counts as reading it.
+      if (fresh.some((m) => m.senderId !== req.user.id)) {
+        await conversations.markRead(conversation.id, req.user.role);
+      }
+
+      const peerIsAdmin = req.user.role !== 'admin';
+      const typingAt = peerIsAdmin ? conversation.admin_typing_at : conversation.user_typing_at;
+      const peerReadAt = peerIsAdmin ? conversation.admin_read_at : conversation.user_read_at;
+      const customer = await users.byId(conversation.user_id);
+
+      res.json({
+        messages: fresh,
+        status: conversation.status,
+        peerTyping: Date.now() - Number(typingAt) < TYPING_WINDOW_MS,
+        peerReadAt: Number(peerReadAt),
+        peerOnline: peerIsAdmin
+          ? await conversations.supportOnline()
+          : Date.now() - Number(customer?.last_seen_at ?? 0) < PRESENCE_WINDOW_MS,
+      });
+    })
+  );
+
+  router.post(
+    '/conversations/:id/typing',
+    requireAuth,
+    wrap(async (req, res) => {
+      const { conversation, error, status } = await authorizeConversation(req.user, req.params.id);
+      if (error) return res.status(status).json({ error });
+      await conversations.markTyping(conversation.id, req.user.role, Boolean(req.body?.isTyping));
+      res.json({ ok: true });
+    })
+  );
+
+  /* ---------------------------------------------------- history + send -- */
+
+  router.get(
+    '/conversations/:id/messages',
+    requireAuth,
+    wrap(async (req, res) => {
+      const { conversation, error, status } = await authorizeConversation(req.user, req.params.id);
+      if (error) return res.status(status).json({ error });
+      const before = req.query.before ? String(req.query.before) : null;
+      const limit = Math.min(Number(req.query.limit) || 50, 100);
+      res.json({
+        messages: (await messages.history(conversation.id, { before, limit })).map(publicMessage),
+      });
+    })
+  );
+
+  router.post(
+    '/conversations/:id/messages',
+    requireAuth,
+    wrap(async (req, res) => {
+      const { conversation, error, status } = await authorizeConversation(req.user, req.params.id);
+      if (error) return res.status(status).json({ error });
+      if (conversation.status === 'closed' && req.user.role !== 'admin') {
+        return res.status(409).json({ error: 'This conversation is closed' });
+      }
+      const check = validateBody(req.body?.body);
+      if (check.error) return res.status(400).json({ error: check.error });
+      if (!rateLimit(req.user.id)) return res.status(429).json({ error: 'Slow down a moment' });
+
+      res.status(201).json({
+        message: await sendMessage({ conversation, sender: req.user, body: check.body }),
+      });
+    })
+  );
+
+  /* --------------------------------------------------- agent console -- */
+
+  router.get(
+    '/admin/conversations',
+    requireAdmin,
+    wrap(async (req, res) => {
+      res.json({
+        conversations: await conversations.list({
+          status: String(req.query.status ?? 'all'),
+          q: String(req.query.q ?? '').trim(),
+          limit: Math.min(Number(req.query.limit) || 100, 200),
+        }),
+        presenceWindowMs: PRESENCE_WINDOW_MS,
+        now: Date.now(),
+      });
+    })
+  );
+
+  router.get(
+    '/admin/conversations/:id',
+    requireAdmin,
+    wrap(async (req, res) => {
+      const conversation = await conversations.byId(req.params.id);
+      if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+      await conversations.markRead(conversation.id, 'admin');
+      const customer = await users.byId(conversation.user_id);
+      res.json({
+        conversation: {
+          id: conversation.id,
+          subject: conversation.subject,
+          status: conversation.status,
+          customer: publicUser(customer),
+          customerOnline: Date.now() - Number(customer?.last_seen_at ?? 0) < PRESENCE_WINDOW_MS,
+        },
+        messages: (await messages.history(conversation.id, { limit: 50 })).map(publicMessage),
+      });
+    })
+  );
+
+  router.patch(
+    '/admin/conversations/:id',
+    requireAdmin,
+    wrap(async (req, res) => {
+      const conversation = await conversations.byId(req.params.id);
+      if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+
+      let updated = conversation;
+      if (req.body?.status !== undefined) {
+        if (!['open', 'closed'].includes(req.body.status)) {
+          return res.status(400).json({ error: 'Status must be open or closed' });
+        }
+        updated = await conversations.setStatus(conversation.id, req.body.status);
+      }
+      if (req.body?.subject !== undefined) {
+        const subject = String(req.body.subject).trim().slice(0, 120);
+        if (!subject) return res.status(400).json({ error: 'Subject cannot be empty' });
+        updated = await conversations.setSubject(conversation.id, subject);
+      }
+      res.json({
+        conversation: { id: updated.id, subject: updated.subject, status: updated.status },
+      });
+    })
+  );
 
   return router;
 }

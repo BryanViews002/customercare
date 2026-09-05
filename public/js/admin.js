@@ -15,20 +15,25 @@
   const statusBtn = document.getElementById('toggle-status');
   const totalUnread = document.getElementById('total-unread');
 
+  const INBOX_POLL_MS = 4000;
+  const INBOX_POLL_MS_IDLE = 20000;
+
   const meRes = await fetch('/api/me').then((r) => r.json());
   if (meRes.user?.role !== 'admin') return (window.location.href = '/admin/login');
   const me = meRes.user;
   document.getElementById('who').textContent = `${me.name} · Agent`;
 
-  const socket = io();
+  const state = { rows: [], filter: 'all', query: '', selected: null, timer: null };
+
   const thread = window.createThread({
-    socket,
     me,
     els,
     emptyState: 'No messages in this conversation yet.',
+    onUpdate: ({ status, peerOnline }) => {
+      if (status) paintStatusButton(status);
+      if (peerOnline !== undefined) paintPresence(peerOnline);
+    },
   });
-
-  const state = { rows: [], filter: 'all', query: '', selected: null, online: new Set() };
 
   /* ------------------------------------------------------------- inbox -- */
 
@@ -43,17 +48,19 @@
     return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' });
   };
 
-  function rowNode(row) {
+  function rowNode(row, presenceWindow, serverNow) {
     const button = document.createElement('button');
     button.className = 'conv';
     button.dataset.id = row.id;
     if (state.selected === row.id) button.setAttribute('aria-current', 'true');
 
+    const online = serverNow - Number(row.last_seen_at ?? 0) < presenceWindow;
+
     const avatar = document.createElement('div');
     avatar.className = 'avatar';
     avatar.textContent = initials(row.user_name);
     const dot = document.createElement('span');
-    dot.className = `dot${state.online.has(row.user_id) ? ' on' : ''}`;
+    dot.className = `dot${online ? ' on' : ''}`;
     avatar.append(dot);
 
     const middle = document.createElement('div');
@@ -71,7 +78,7 @@
     side.className = 'conv-side';
     const time = document.createElement('div');
     time.className = 'conv-time';
-    time.textContent = relative(row.updated_at);
+    time.textContent = relative(Number(row.updated_at));
     side.append(time);
 
     if (row.unread > 0) {
@@ -91,21 +98,20 @@
     return button;
   }
 
-  function renderList() {
+  function renderList(presenceWindow = 20000, serverNow = Date.now()) {
     list.replaceChildren();
-    const rows = state.rows.filter(
-      (row) => state.filter === 'all' || row.status === state.filter
-    );
+    const rows = state.rows.filter((row) => state.filter === 'all' || row.status === state.filter);
+
     if (rows.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty';
       empty.textContent = 'No conversations here yet.';
       list.append(empty);
     } else {
-      for (const row of rows) list.append(rowNode(row));
+      for (const row of rows) list.append(rowNode(row, presenceWindow, serverNow));
     }
 
-    const unread = state.rows.reduce((n, row) => n + row.unread, 0);
+    const unread = state.rows.reduce((n, row) => n + Number(row.unread), 0);
     totalUnread.hidden = unread === 0;
     totalUnread.textContent = `${unread} unread`;
     document.title = unread ? `(${unread}) Support inbox` : 'Support inbox';
@@ -114,10 +120,32 @@
   async function loadList() {
     const params = new URLSearchParams({ status: 'all' });
     if (state.query) params.set('q', state.query);
-    const data = await fetch(`/api/admin/conversations?${params}`).then((r) => r.json());
-    state.rows = data.conversations ?? [];
-    renderList();
+    try {
+      const data = await fetch(`/api/admin/conversations?${params}`).then((r) => r.json());
+      if (!data.conversations) return;
+      state.rows = data.conversations;
+      if (state.selected) {
+        const row = state.rows.find((r) => r.id === state.selected);
+        if (row) row.unread = 0; // the open thread is being read right now
+      }
+      renderList(data.presenceWindowMs, data.now);
+    } catch {
+      /* transient — the next tick retries */
+    }
   }
+
+  function scheduleInbox() {
+    clearTimeout(state.timer);
+    state.timer = setTimeout(async () => {
+      await loadList();
+      scheduleInbox();
+    }, document.hidden ? INBOX_POLL_MS_IDLE : INBOX_POLL_MS);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) loadList();
+    scheduleInbox();
+  });
 
   /* -------------------------------------------------------- open thread -- */
 
@@ -127,39 +155,52 @@
     noSelection.hidden = true;
     main.classList.add('viewing');
 
-    socket.emit('conversation:join', { conversationId }, (reply) => {
-      if (reply?.error) {
-        noSelection.textContent = reply.error;
-        chat.hidden = true;
-        noSelection.hidden = false;
-        return;
-      }
-      thread.load(reply);
-      paintHeader(reply.conversation);
+    try {
+      const data = await fetch(`/api/admin/conversations/${conversationId}`).then((r) => r.json());
+      if (!data.conversation) throw new Error(data.error || 'Could not open conversation');
+      thread.load(data);
+      paintHeader(data.conversation);
 
       const row = state.rows.find((r) => r.id === conversationId);
       if (row) row.unread = 0;
       renderList();
-    });
+    } catch (err) {
+      noSelection.textContent = err.message;
+      chat.hidden = true;
+      noSelection.hidden = false;
+    }
   }
 
   function paintHeader(conversation) {
     document.getElementById('customer-name').textContent = conversation.customer.name;
-    const bits = [conversation.customer.email || 'Guest visitor'];
-    bits.push(conversation.customerOnline ? 'online now' : 'offline');
-    if (conversation.status === 'closed') bits.push('resolved');
-    document.getElementById('customer-meta').textContent = bits.join(' · ');
-    statusBtn.textContent = conversation.status === 'closed' ? 'Reopen' : 'Mark resolved';
-    statusBtn.dataset.next = conversation.status === 'closed' ? 'open' : 'closed';
+    paintPresence(conversation.customerOnline);
+    paintStatusButton(conversation.status);
+  }
+
+  function paintPresence(online) {
+    const meta = document.getElementById('customer-meta');
+    const bits = ['Guest visitor', online ? 'online now' : 'offline'];
+    if (thread.status === 'closed') bits.push('resolved');
+    meta.textContent = bits.join(' · ');
+  }
+
+  function paintStatusButton(status) {
+    statusBtn.textContent = status === 'closed' ? 'Reopen' : 'Mark resolved';
+    statusBtn.dataset.next = status === 'closed' ? 'open' : 'closed';
   }
 
   statusBtn.addEventListener('click', async () => {
     if (!state.selected) return;
-    await fetch(`/api/admin/conversations/${state.selected}`, {
+    const data = await fetch(`/api/admin/conversations/${state.selected}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: statusBtn.dataset.next }),
-    });
+    }).then((r) => r.json());
+    if (data.conversation) {
+      thread.setStatus(data.conversation.status);
+      paintStatusButton(data.conversation.status);
+      loadList();
+    }
   });
 
   /* ------------------------------------------------------------ filters -- */
@@ -192,40 +233,6 @@
     window.location.href = '/admin/login';
   });
 
-  /* ------------------------------------------------------ live updates -- */
-
-  socket.on('inbox:update', (row) => {
-    if (!row) return;
-    const index = state.rows.findIndex((r) => r.id === row.id);
-    if (index >= 0) state.rows.splice(index, 1);
-    if (row.id === state.selected) row.unread = 0;
-    state.rows.unshift(row);
-    state.rows.sort((a, b) => b.updated_at - a.updated_at);
-    renderList();
-  });
-
-  socket.on('presence:user', ({ userId, online }) => {
-    if (online) state.online.add(userId);
-    else state.online.delete(userId);
-    renderList();
-    if (state.selected) {
-      const row = state.rows.find((r) => r.id === state.selected);
-      if (row?.user_id === userId) {
-        const meta = document.getElementById('customer-meta').textContent.split(' · ');
-        meta[1] = online ? 'online now' : 'offline';
-        document.getElementById('customer-meta').textContent = meta.join(' · ');
-      }
-    }
-  });
-
-  socket.on('conversation:updated', (patch) => {
-    if (patch.id !== state.selected) return;
-    thread.setStatus(patch.status);
-    statusBtn.textContent = patch.status === 'closed' ? 'Reopen' : 'Mark resolved';
-    statusBtn.dataset.next = patch.status === 'closed' ? 'open' : 'closed';
-  });
-
-  socket.on('connect', loadList);
-
   await loadList();
+  scheduleInbox();
 })();

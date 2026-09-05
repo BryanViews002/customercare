@@ -1,46 +1,88 @@
-import { DatabaseSync } from 'node:sqlite';
+/**
+ * Postgres data layer.
+ *
+ * Production (Vercel) talks to Neon over `pg`. With no POSTGRES_URL set we fall
+ * back to PGlite — a real Postgres running in-process — so the app runs locally
+ * with no database to install and no credentials to hold.
+ *
+ * Serverless calls this on every cold start, so schema creation and admin
+ * seeding are guarded by a cached promise and are safe to run repeatedly.
+ */
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import pg from 'pg';
 
-const DB_PATH = process.env.DB_PATH || resolve(process.cwd(), 'data', 'chat.db');
-mkdirSync(dirname(DB_PATH), { recursive: true });
+// Timestamps and COUNT(*) come back as int8, which pg stringifies by default.
+pg.types.setTypeParser(pg.types.builtins.INT8, (value) => Number(value));
 
-export const db = new DatabaseSync(DB_PATH);
+let clientPromise = null;
 
-db.exec('PRAGMA journal_mode = WAL');
-db.exec('PRAGMA foreign_keys = ON');
+async function connect() {
+  const url = process.env.POSTGRES_URL || process.env.DATABASE_URL;
 
-db.exec(`
-  -- Customers are guests: no email, no password, identified by their session
-  -- cookie alone. Only agents have credentials.
+  if (url) {
+    // One small pool per warm instance; serverless reuses it across invocations.
+    const pool = new pg.Pool({
+      connectionString: url,
+      max: 1,
+      idleTimeoutMillis: 10_000,
+      ssl: url.includes('localhost') ? false : { rejectUnauthorized: false },
+    });
+    return { query: (text, params) => pool.query(text, params) };
+  }
+
+  const { PGlite } = await import('@electric-sql/pglite');
+  const { mkdirSync } = await import('node:fs');
+  const { dirname } = await import('node:path');
+  const dir = process.env.PGLITE_DIR || './data/pgdata';
+  mkdirSync(dirname(dir), { recursive: true }); // PGlite won't create its parent
+  const lite = await PGlite.create(dir);
+  return {
+    query: async (text, params) => {
+      const result = await lite.query(text, params);
+      // PGlite hands back bigint for int8; normalise it to plain numbers.
+      return { rows: result.rows.map(normalizeRow) };
+    },
+  };
+}
+
+const normalizeRow = (row) => {
+  const out = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[key] = typeof value === 'bigint' ? Number(value) : value;
+  }
+  return out;
+};
+
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS users (
     id           TEXT PRIMARY KEY,
     email        TEXT UNIQUE,
     name         TEXT NOT NULL,
     password     TEXT,
     role         TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin')),
-    created_at   INTEGER NOT NULL,
-    last_seen_at INTEGER
+    created_at   BIGINT NOT NULL,
+    last_seen_at BIGINT
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
     token      TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
+    created_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
   CREATE TABLE IF NOT EXISTS conversations (
-    id            TEXT PRIMARY KEY,
-    user_id       TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-    subject       TEXT NOT NULL DEFAULT 'Support request',
-    status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
-    created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL,
-    user_read_at  INTEGER NOT NULL DEFAULT 0,
-    admin_read_at INTEGER NOT NULL DEFAULT 0
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    subject         TEXT NOT NULL DEFAULT 'Support request',
+    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL,
+    user_read_at    BIGINT NOT NULL DEFAULT 0,
+    admin_read_at   BIGINT NOT NULL DEFAULT 0,
+    user_typing_at  BIGINT NOT NULL DEFAULT 0,
+    admin_typing_at BIGINT NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at DESC);
 
@@ -50,22 +92,73 @@ db.exec(`
     sender_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     sender_role     TEXT NOT NULL CHECK (sender_role IN ('user','admin','system')),
     body            TEXT NOT NULL,
-    created_at      INTEGER NOT NULL
+    created_at      BIGINT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, created_at);
-`);
+`;
+
+/** Resolves to a ready client: connected, migrated, admin seeded. */
+export function db() {
+  clientPromise ??= (async () => {
+    const client = await connect();
+    for (const statement of SCHEMA.split(';')) {
+      if (statement.trim()) await client.query(statement);
+    }
+    await seedAdmin(client);
+    return client;
+  })().catch((err) => {
+    clientPromise = null; // never cache a failed connection — let the next request retry
+    throw err;
+  });
+  return clientPromise;
+}
+
+const query = async (text, params) => (await db()).query(text, params);
+const one = async (text, params) => (await query(text, params)).rows[0] ?? null;
+const all = async (text, params) => (await query(text, params)).rows;
 
 const now = () => Date.now();
+
+/**
+ * Creates the support account from the environment on first boot. Imported by
+ * db() rather than exported, so it can never race with a request.
+ */
+async function seedAdmin(client) {
+  const email = process.env.ADMIN_EMAIL;
+  const password = process.env.ADMIN_PASSWORD;
+  if (!email || !password) return;
+
+  const existing = await client.query('SELECT id FROM users WHERE email = $1', [
+    String(email).toLowerCase(),
+  ]);
+  if (existing.rows.length > 0) return;
+
+  const bcrypt = (await import('bcryptjs')).default;
+  await client.query(
+    `INSERT INTO users (id, email, name, password, role, created_at)
+     VALUES ($1, $2, $3, $4, 'admin', $5)
+     ON CONFLICT (email) DO NOTHING`,
+    [
+      randomUUID(),
+      String(email).toLowerCase(),
+      process.env.ADMIN_NAME || 'Support Team',
+      await bcrypt.hash(password, 10),
+      now(),
+    ]
+  );
+  console.log(`[auth] Seeded admin account ${email}`);
+}
 
 /* ---------------------------------------------------------------- users -- */
 
 export const users = {
-  create({ email = null, name, password = null, role = 'user' }) {
+  async create({ email = null, name, password = null, role = 'user' }) {
     const id = randomUUID();
-    db.prepare(
+    await query(
       `INSERT INTO users (id, email, name, password, role, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, email ? String(email).toLowerCase() : null, name, password, role, now());
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, email ? String(email).toLowerCase() : null, name, password, role, now()]
+    );
     return this.byId(id);
   },
 
@@ -76,24 +169,19 @@ export const users = {
   },
 
   rename(id, name) {
-    db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, id);
-    return this.byId(id);
+    return one('UPDATE users SET name = $1 WHERE id = $2 RETURNING *', [name, id]);
   },
 
   byId(id) {
-    return db.prepare('SELECT * FROM users WHERE id = ?').get(id) ?? null;
+    return one('SELECT * FROM users WHERE id = $1', [id]);
   },
 
   byEmail(email) {
-    return db.prepare('SELECT * FROM users WHERE email = ?').get(String(email).toLowerCase()) ?? null;
+    return one('SELECT * FROM users WHERE email = $1', [String(email).toLowerCase()]);
   },
 
   touch(id) {
-    db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(now(), id);
-  },
-
-  adminIds() {
-    return db.prepare("SELECT id FROM users WHERE role = 'admin'").all().map((r) => r.id);
+    return query('UPDATE users SET last_seen_at = $1 WHERE id = $2', [now(), id]);
   },
 };
 
@@ -102,163 +190,194 @@ export const users = {
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
 
 export const sessions = {
-  create(userId) {
+  async create(userId) {
     const token = randomUUID() + randomUUID().replaceAll('-', '');
     const ts = now();
-    db.prepare(
-      'INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)'
-    ).run(token, userId, ts, ts + SESSION_TTL_MS);
+    await query(
+      'INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)',
+      [token, userId, ts, ts + SESSION_TTL_MS]
+    );
     return { token, expiresAt: ts + SESSION_TTL_MS };
   },
 
   userFor(token) {
     if (!token) return null;
-    const row = db
-      .prepare(
-        `SELECT u.* FROM sessions s
-         JOIN users u ON u.id = s.user_id
-         WHERE s.token = ? AND s.expires_at > ?`
-      )
-      .get(token, now());
-    return row ?? null;
+    return one(
+      `SELECT u.* FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.token = $1 AND s.expires_at > $2`,
+      [token, now()]
+    );
   },
 
   destroy(token) {
-    if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
-  },
-
-  purgeExpired() {
-    db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now());
+    if (!token) return null;
+    return query('DELETE FROM sessions WHERE token = $1', [token]);
   },
 };
 
 /* -------------------------------------------------------- conversations -- */
 
+/** A side counts as present if it polled within this window. */
+export const PRESENCE_WINDOW_MS = 20_000;
+export const TYPING_WINDOW_MS = 4_000;
+
 export const conversations = {
   /** Every customer gets exactly one private thread, created on demand. */
-  ensureFor(userId) {
-    const existing = db.prepare('SELECT * FROM conversations WHERE user_id = ?').get(userId);
+  async ensureFor(userId) {
+    const existing = await one('SELECT * FROM conversations WHERE user_id = $1', [userId]);
     if (existing) return existing;
-    const id = randomUUID();
     const ts = now();
-    db.prepare(
-      'INSERT INTO conversations (id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?)'
-    ).run(id, userId, ts, ts);
-    return db.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
+    return one(
+      `INSERT INTO conversations (id, user_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $3)
+       ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+       RETURNING *`,
+      [randomUUID(), userId, ts]
+    );
   },
 
   byId(id) {
-    return db.prepare('SELECT * FROM conversations WHERE id = ?').get(id) ?? null;
+    return one('SELECT * FROM conversations WHERE id = $1', [id]);
   },
 
   setStatus(id, status) {
-    db.prepare('UPDATE conversations SET status = ?, updated_at = ? WHERE id = ?').run(status, now(), id);
-    return this.byId(id);
+    return one(
+      'UPDATE conversations SET status = $1, updated_at = $2 WHERE id = $3 RETURNING *',
+      [status, now(), id]
+    );
   },
 
   setSubject(id, subject) {
-    db.prepare('UPDATE conversations SET subject = ?, updated_at = ? WHERE id = ?').run(subject, now(), id);
-    return this.byId(id);
+    return one(
+      'UPDATE conversations SET subject = $1, updated_at = $2 WHERE id = $3 RETURNING *',
+      [subject, now(), id]
+    );
   },
 
   markRead(id, role) {
     const column = role === 'admin' ? 'admin_read_at' : 'user_read_at';
-    db.prepare(`UPDATE conversations SET ${column} = ? WHERE id = ?`).run(now(), id);
+    return query(`UPDATE conversations SET ${column} = $1 WHERE id = $2`, [now(), id]);
   },
 
-  /** Inbox rows for the admin console, newest activity first. */
+  /** Polling replaces the typing socket event: stamp now, read it back later. */
+  markTyping(id, role, isTyping) {
+    const column = role === 'admin' ? 'admin_typing_at' : 'user_typing_at';
+    return query(`UPDATE conversations SET ${column} = $1 WHERE id = $2`, [
+      isTyping ? now() : 0,
+      id,
+    ]);
+  },
+
+  /** Inbox rows for the agent console, newest activity first. */
   list({ status = 'all', q = '', limit = 100 } = {}) {
     const clauses = [];
     const params = [];
     if (status === 'open' || status === 'closed') {
-      clauses.push('c.status = ?');
       params.push(status);
+      clauses.push(`c.status = $${params.length}`);
     }
     if (q) {
-      clauses.push('(u.name LIKE ? OR u.email LIKE ? OR c.subject LIKE ?)');
-      const like = `%${q}%`;
-      params.push(like, like, like);
+      params.push(`%${q}%`);
+      clauses.push(
+        `(u.name ILIKE $${params.length} OR u.email ILIKE $${params.length} OR c.subject ILIKE $${params.length})`
+      );
     }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     params.push(limit);
 
-    return db
-      .prepare(
-        `SELECT c.id, c.subject, c.status, c.updated_at, c.admin_read_at,
-                u.id AS user_id, u.name AS user_name, u.email AS user_email, u.last_seen_at,
-                (SELECT body FROM messages m WHERE m.conversation_id = c.id
-                  ORDER BY m.created_at DESC LIMIT 1) AS last_body,
-                (SELECT sender_role FROM messages m WHERE m.conversation_id = c.id
-                  ORDER BY m.created_at DESC LIMIT 1) AS last_role,
-                (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id
-                  AND m.sender_role = 'user' AND m.created_at > c.admin_read_at) AS unread
-         FROM conversations c
-         JOIN users u ON u.id = c.user_id
-         ${where}
-         ORDER BY c.updated_at DESC
-         LIMIT ?`
-      )
-      .all(...params);
+    return all(
+      `SELECT c.id, c.subject, c.status, c.updated_at, c.admin_read_at, c.user_typing_at,
+              u.id AS user_id, u.name AS user_name, u.email AS user_email, u.last_seen_at,
+              (SELECT body FROM messages m WHERE m.conversation_id = c.id
+                ORDER BY m.created_at DESC LIMIT 1) AS last_body,
+              (SELECT sender_role FROM messages m WHERE m.conversation_id = c.id
+                ORDER BY m.created_at DESC LIMIT 1) AS last_role,
+              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id
+                AND m.sender_role = 'user' AND m.created_at > c.admin_read_at) AS unread
+       FROM conversations c
+       JOIN users u ON u.id = c.user_id
+       ${where}
+       ORDER BY c.updated_at DESC
+       LIMIT $${params.length}`,
+      params
+    );
   },
 
-  unreadForUser(userId) {
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM messages m
-         JOIN conversations c ON c.id = m.conversation_id
-         WHERE c.user_id = ? AND m.sender_role = 'admin' AND m.created_at > c.user_read_at`
-      )
-      .get(userId);
+  async unreadForUser(userId) {
+    const row = await one(
+      `SELECT COUNT(*) AS n FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+       WHERE c.user_id = $1 AND m.sender_role = 'admin' AND m.created_at > c.user_read_at`,
+      [userId]
+    );
     return row?.n ?? 0;
+  },
+
+  /** Is any agent currently polling? Drives the customer's online dot. */
+  async supportOnline() {
+    const row = await one(
+      `SELECT COUNT(*) AS n FROM users
+       WHERE role = 'admin' AND last_seen_at > $1`,
+      [now() - PRESENCE_WINDOW_MS]
+    );
+    return (row?.n ?? 0) > 0;
   },
 };
 
-/* ------------------------------------------------------------- messages -- */
+/* -------------------------------------------------------------- messages -- */
 
 export const messages = {
-  create({ conversationId, senderId, senderRole, body }) {
+  async create({ conversationId, senderId, senderRole, body }) {
     const id = randomUUID();
     const ts = now();
-    db.prepare(
+    await query(
       `INSERT INTO messages (id, conversation_id, sender_id, sender_role, body, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, conversationId, senderId, senderRole, body, ts);
-    db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').run(ts, conversationId);
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, conversationId, senderId, senderRole, body, ts]
+    );
+    await query('UPDATE conversations SET updated_at = $1 WHERE id = $2', [ts, conversationId]);
     return this.byId(id);
   },
 
   byId(id) {
-    return (
-      db
-        .prepare(
-          `SELECT m.*, u.name AS sender_name FROM messages m
-           JOIN users u ON u.id = m.sender_id WHERE m.id = ?`
-        )
-        .get(id) ?? null
+    return one(
+      `SELECT m.*, u.name AS sender_name FROM messages m
+       JOIN users u ON u.id = m.sender_id WHERE m.id = $1`,
+      [id]
     );
   },
 
   /** Page backwards through history: pass the oldest message id you hold. */
-  history(conversationId, { before = null, limit = 50 } = {}) {
+  async history(conversationId, { before = null, limit = 50 } = {}) {
     const rows = before
-      ? db
-          .prepare(
-            `SELECT m.*, u.name AS sender_name FROM messages m
-             JOIN users u ON u.id = m.sender_id
-             WHERE m.conversation_id = ?
-               AND m.created_at < (SELECT created_at FROM messages WHERE id = ?)
-             ORDER BY m.created_at DESC LIMIT ?`
-          )
-          .all(conversationId, before, limit)
-      : db
-          .prepare(
-            `SELECT m.*, u.name AS sender_name FROM messages m
-             JOIN users u ON u.id = m.sender_id
-             WHERE m.conversation_id = ?
-             ORDER BY m.created_at DESC LIMIT ?`
-          )
-          .all(conversationId, limit);
+      ? await all(
+          `SELECT m.*, u.name AS sender_name FROM messages m
+           JOIN users u ON u.id = m.sender_id
+           WHERE m.conversation_id = $1
+             AND m.created_at < (SELECT created_at FROM messages WHERE id = $2)
+           ORDER BY m.created_at DESC LIMIT $3`,
+          [conversationId, before, limit]
+        )
+      : await all(
+          `SELECT m.*, u.name AS sender_name FROM messages m
+           JOIN users u ON u.id = m.sender_id
+           WHERE m.conversation_id = $1
+           ORDER BY m.created_at DESC LIMIT $2`,
+          [conversationId, limit]
+        );
     return rows.reverse();
+  },
+
+  /** Everything newer than `after` — the heart of the polling loop. */
+  since(conversationId, after) {
+    return all(
+      `SELECT m.*, u.name AS sender_name FROM messages m
+       JOIN users u ON u.id = m.sender_id
+       WHERE m.conversation_id = $1 AND m.created_at > $2
+       ORDER BY m.created_at ASC LIMIT 200`,
+      [conversationId, after]
+    );
   },
 };
 
@@ -274,5 +393,5 @@ export const publicMessage = (m) =>
     senderRole: m.sender_role,
     senderName: m.sender_name,
     body: m.body,
-    createdAt: m.created_at,
+    createdAt: Number(m.created_at),
   };

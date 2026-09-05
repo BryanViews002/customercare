@@ -17,9 +17,9 @@
     "cookie": "^0.6.0",
     "cookie-parser": "^1.4.6",
     "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+    "pg": "^8.23.0"
   },
   "devDependencies": {
-    "socket.io-client": "^4.8.3"
+    "@electric-sql/pglite": "^0.5.8"
   }
 }

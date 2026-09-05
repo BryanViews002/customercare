@@ -1,18 +1,28 @@
 /**
  * Shared conversation view used by both the customer page and the agent
- * console. Renders history, streams new messages, and owns the composer.
+ * console. Renders history, polls for new messages, and owns the composer.
  * All message text is written with textContent — never innerHTML.
+ *
+ * There is no WebSocket: serverless can't hold one open, so the thread asks
+ * /poll for anything newer than the last message it holds. The loop sleeps
+ * while the tab is hidden and wakes immediately on focus.
  */
-window.createThread = function createThread({ socket, me, els, emptyState }) {
+const POLL_MS = 2500;
+const POLL_MS_IDLE = 15000;
+
+window.createThread = function createThread({ me, els, emptyState, onUpdate }) {
   const state = {
     conversationId: null,
     status: 'open',
     messages: [],
+    lastTs: 0,
     loadingMore: false,
     exhausted: false,
-    lastReadByPeer: 0,
+    peerReadAt: 0,
     typingTimer: null,
     typingSent: false,
+    timer: null,
+    failures: 0,
   };
 
   const fmtTime = (ts) =>
@@ -34,6 +44,16 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     els.messages.scrollTop = els.messages.scrollHeight;
   };
 
+  const api = (path, init) =>
+    fetch(path, {
+      ...init,
+      headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}) },
+    }).then(async (res) => {
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+      return body;
+    });
+
   /* ------------------------------------------------------------ render -- */
 
   function messageNode(message, previous) {
@@ -42,16 +62,17 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     wrap.className = `msg ${isMine ? 'out' : 'in'}`;
     wrap.dataset.id = message.id;
 
-    const newGroup = !previous || previous.senderId !== message.senderId ||
+    const newGroup =
+      !previous ||
+      previous.senderId !== message.senderId ||
       message.createdAt - previous.createdAt > 5 * 60_000;
     if (newGroup) {
       wrap.classList.add('start');
       if (!isMine) {
         const who = document.createElement('div');
         who.className = 'who-line';
-        who.textContent = message.senderRole === 'admin'
-          ? `${message.senderName} · Support`
-          : message.senderName;
+        who.textContent =
+          message.senderRole === 'admin' ? `${message.senderName} · Support` : message.senderName;
         wrap.append(who);
       }
     }
@@ -109,7 +130,7 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
   function renderReceipt() {
     els.messages.querySelector('.receipt')?.remove();
     const mine = [...state.messages].reverse().find((m) => m.senderId === me.id);
-    if (!mine || state.lastReadByPeer < mine.createdAt) return;
+    if (!mine || state.peerReadAt < mine.createdAt) return;
     const node = els.messages.querySelector(`[data-id="${CSS.escape(mine.id)}"]`);
     if (!node) return;
     const tag = document.createElement('div');
@@ -118,28 +139,76 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     node.append(tag);
   }
 
-  function appendMessage(message) {
-    const stick = nearBottom();
-    if (state.messages.some((m) => m.id === message.id)) return;
-
-    // Reconcile the optimistic bubble, if this is our own echo.
-    const pending = els.messages.querySelector('.msg.pending');
-    if (pending && message.senderId === me.id && pending.dataset.body === message.body) {
-      pending.remove();
+  function absorb(list) {
+    let added = false;
+    for (const message of list) {
+      if (state.messages.some((m) => m.id === message.id)) continue;
+      state.messages.push(message);
+      state.lastTs = Math.max(state.lastTs, message.createdAt);
+      added = true;
     }
-
-    state.messages.push(message);
-    render();
-    if (stick || message.senderId === me.id) scrollToBottom();
-    if (message.senderId !== me.id && document.hasFocus()) markRead();
+    if (added) state.messages.sort((a, b) => a.createdAt - b.createdAt);
+    return added;
   }
+
+  /* ------------------------------------------------------------ polling -- */
+
+  async function poll() {
+    if (!state.conversationId) return;
+    try {
+      const data = await api(
+        `/api/conversations/${state.conversationId}/poll?after=${state.lastTs}`
+      );
+      state.failures = 0;
+
+      const stick = nearBottom();
+      const grew = absorb(data.messages ?? []);
+      state.peerReadAt = data.peerReadAt ?? 0;
+
+      if (grew) {
+        render();
+        if (stick) scrollToBottom();
+      } else {
+        renderReceipt();
+      }
+
+      els.typing.textContent = data.peerTyping ? 'typing…' : '';
+
+      if (data.status !== state.status) {
+        state.status = data.status;
+        onUpdate?.({ status: data.status, peerOnline: data.peerOnline });
+      } else {
+        onUpdate?.({ peerOnline: data.peerOnline });
+      }
+    } catch {
+      state.failures += 1; // back off below after repeated failures
+    }
+  }
+
+  function schedule() {
+    clearTimeout(state.timer);
+    if (!state.conversationId) return;
+    const base = document.hidden ? POLL_MS_IDLE : POLL_MS;
+    const delay = Math.min(base * (1 + Math.min(state.failures, 4)), 30_000);
+    state.timer = setTimeout(async () => {
+      await poll();
+      schedule();
+    }, delay);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && state.conversationId) {
+      poll().then(schedule);
+    } else {
+      schedule();
+    }
+  });
 
   /* ------------------------------------------------------------ sending -- */
 
   function optimistic(body) {
     const wrap = document.createElement('div');
     wrap.className = 'msg out pending start';
-    wrap.dataset.body = body;
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     bubble.textContent = body;
@@ -154,7 +223,7 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
   }
 
   /** Sends `text`, or whatever is in the composer when called with nothing. */
-  function send(text) {
+  async function send(text) {
     const body = (text ?? els.input.value).trim();
     if (!body || !state.conversationId || els.input.disabled) return;
 
@@ -163,51 +232,48 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     stopTyping();
     const node = optimistic(body);
 
-    socket.emit('message:send', { conversationId: state.conversationId, body }, (reply) => {
-      if (reply?.error) {
-        node.classList.remove('pending');
-        node.classList.add('failed');
-        node.querySelector('.meta').textContent = reply.error;
-        return;
-      }
+    try {
+      const data = await api(`/api/conversations/${state.conversationId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ body }),
+      });
       node.remove();
-      appendMessage(reply.message);
-    });
+      absorb([data.message]);
+      render();
+      scrollToBottom();
+    } catch (err) {
+      node.classList.remove('pending');
+      node.classList.add('failed');
+      node.querySelector('.meta').textContent = err.message;
+    }
   }
 
   /* ------------------------------------------------------------- typing -- */
 
+  function pushTyping(isTyping) {
+    if (!state.conversationId) return;
+    fetch(`/api/conversations/${state.conversationId}/typing`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isTyping }),
+    }).catch(() => {});
+  }
+
   function stopTyping() {
     clearTimeout(state.typingTimer);
-    if (state.typingSent && state.conversationId) {
-      socket.emit('typing', { conversationId: state.conversationId, isTyping: false });
+    if (state.typingSent) {
+      pushTyping(false);
       state.typingSent = false;
     }
   }
 
   function noteTyping() {
-    if (!state.conversationId) return;
     if (!state.typingSent) {
-      socket.emit('typing', { conversationId: state.conversationId, isTyping: true });
+      pushTyping(true);
       state.typingSent = true;
     }
     clearTimeout(state.typingTimer);
     state.typingTimer = setTimeout(stopTyping, 2500);
-  }
-
-  let typingClear = null;
-  function showTyping(name, isTyping) {
-    clearTimeout(typingClear);
-    els.typing.textContent = isTyping ? `${name} is typing…` : '';
-    if (isTyping) typingClear = setTimeout(() => (els.typing.textContent = ''), 4000);
-  }
-
-  /* --------------------------------------------------------------- read -- */
-
-  function markRead() {
-    if (state.conversationId) {
-      socket.emit('conversation:read', { conversationId: state.conversationId });
-    }
   }
 
   /* ------------------------------------------------------ older history -- */
@@ -218,20 +284,22 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     const before = state.messages[0].id;
     const previousHeight = els.messages.scrollHeight;
 
-    socket.emit(
-      'messages:history',
-      { conversationId: state.conversationId, before },
-      (reply) => {
-        state.loadingMore = false;
-        if (reply?.error || !reply?.messages?.length) {
-          state.exhausted = true;
-          return;
-        }
-        state.messages = [...reply.messages, ...state.messages];
-        render();
-        els.messages.scrollTop = els.messages.scrollHeight - previousHeight;
+    try {
+      const data = await api(
+        `/api/conversations/${state.conversationId}/messages?before=${before}`
+      );
+      if (!data.messages?.length) {
+        state.exhausted = true;
+        return;
       }
-    );
+      state.messages = [...data.messages, ...state.messages];
+      render();
+      els.messages.scrollTop = els.messages.scrollHeight - previousHeight;
+    } catch {
+      state.exhausted = true;
+    } finally {
+      state.loadingMore = false;
+    }
   }
 
   /* --------------------------------------------------------- composer UI -- */
@@ -246,9 +314,6 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     event.preventDefault();
     send();
   });
-
-  // The composer is the only place a message can start, so let callers reach it.
-  const sendText = (text) => send(text);
 
   els.input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -267,29 +332,6 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
     if (els.messages.scrollTop < 60) loadOlder();
   });
 
-  window.addEventListener('focus', () => {
-    if (state.conversationId && nearBottom()) markRead();
-  });
-
-  /* ------------------------------------------------------ socket wiring -- */
-
-  socket.on('message:new', (message) => {
-    if (message.conversationId === state.conversationId) appendMessage(message);
-  });
-
-  socket.on('typing', (payload) => {
-    if (payload.conversationId === state.conversationId) {
-      showTyping(payload.name, payload.isTyping);
-    }
-  });
-
-  socket.on('conversation:read', (payload) => {
-    if (payload.conversationId === state.conversationId && payload.role !== me.role) {
-      state.lastReadByPeer = payload.at;
-      renderReceipt();
-    }
-  });
-
   return {
     get conversationId() {
       return state.conversationId;
@@ -298,27 +340,27 @@ window.createThread = function createThread({ socket, me, els, emptyState }) {
       return state.status;
     },
     /** Swap the view to a conversation and paint its history. */
-    load({ conversation, messages }) {
+    load({ conversation, messages: history }) {
       state.conversationId = conversation.id;
       state.status = conversation.status;
-      state.messages = messages;
-      state.exhausted = messages.length < 50;
-      state.lastReadByPeer = 0;
+      state.messages = history;
+      state.lastTs = history.reduce((max, m) => Math.max(max, m.createdAt), 0);
+      state.exhausted = history.length < 50;
+      state.peerReadAt = 0;
+      state.failures = 0;
       els.typing.textContent = '';
       render();
       scrollToBottom();
-      markRead();
+      schedule();
     },
+    sendText: (text) => send(text),
     setStatus(status) {
       state.status = status;
     },
-    sendText,
     setComposerEnabled,
-    clear() {
+    stop() {
+      clearTimeout(state.timer);
       state.conversationId = null;
-      state.messages = [];
-      els.messages.replaceChildren();
-      els.typing.textContent = '';
     },
   };
 };
