@@ -48,6 +48,8 @@ export function createApp() {
 
   app.use((err, _req, res, _next) => {
     console.error('[error]', err);
+    // Misconfiguration is the operator's problem to fix, so say what's wrong.
+    if (err?.code === 'CONFIG') return res.status(503).json({ error: err.message });
     res.status(500).json({ error: 'Something went wrong' });
   });
 

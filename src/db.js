@@ -30,6 +30,17 @@ async function connect() {
     return { query: (text, params) => pool.query(text, params) };
   }
 
+  // PGlite writes to disk, which serverless does not have. Fail with something
+  // readable rather than an ENOENT from deep inside the driver.
+  if (process.env.VERCEL) {
+    const err = new Error(
+      'No database configured. In Vercel: Storage → Create Database → Neon (Postgres), ' +
+        'which sets POSTGRES_URL, then redeploy.'
+    );
+    err.code = 'CONFIG';
+    throw err;
+  }
+
   const { PGlite } = await import('@electric-sql/pglite');
   const { mkdirSync } = await import('node:fs');
   const { dirname } = await import('node:path');
