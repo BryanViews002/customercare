@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Support chat</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <main class="customer-main">
+    <div class="customer-card">
+      <section class="chat">
+        <div class="chat-head">
+          <div class="agent-badge">◈</div>
+          <div>
+            <h2>Support team</h2>
+            <p id="subhead"></p>
+          </div>
+        </div>
+
+        <div class="messages" id="messages"></div>
+        <div class="typing" id="typing"></div>
+
+        <form class="composer" id="composer">
+          <textarea id="input" rows="1" placeholder="Write a message…" maxlength="4000"></textarea>
+          <button class="send" id="send" type="submit">Send</button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/thread.js"></script>
+  <script src="/js/chat.js"></script>
+</body>
+</html>

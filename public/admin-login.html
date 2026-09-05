@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent sign in</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <main class="auth-wrap">
+    <div class="auth-card">
+      <div class="brand"><span class="brand-dot">◈</span> Support console</div>
+      <p class="auth-sub">Agent access only. Customers chat without an account.</p>
+
+      <p class="alert" id="error" role="alert" hidden></p>
+
+      <form id="form" autocomplete="on">
+        <div class="field">
+          <label for="email">Work email</label>
+          <input id="email" type="email" required autocomplete="username" />
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" type="password" required autocomplete="current-password" />
+        </div>
+        <button class="btn" type="submit">Sign in</button>
+      </form>
+
+      <p class="hint"><a href="/">Go to the customer chat</a></p>
+    </div>
+  </main>
+
+  <script src="/js/admin-login.js"></script>
+</body>
+</html>

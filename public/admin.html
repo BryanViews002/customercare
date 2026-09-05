@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Support inbox</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-dot">◈</span> Support console</div>
+      <span class="pill" id="total-unread" hidden></span>
+      <div class="spacer"></div>
+      <span class="who" id="who"></span>
+      <button class="link-btn" id="logout">Sign out</button>
+    </header>
+
+    <main class="admin-main" id="main">
+      <aside class="inbox">
+        <div class="inbox-head">
+          <h2>Conversations</h2>
+          <input id="search" type="search" placeholder="Search by name or subject" />
+        </div>
+        <div class="filters">
+          <button data-status="all" aria-pressed="true">All</button>
+          <button data-status="open" aria-pressed="false">Open</button>
+          <button data-status="closed" aria-pressed="false">Resolved</button>
+        </div>
+        <div class="conv-list" id="conv-list"></div>
+      </aside>
+
+      <section class="thread">
+        <div class="chat" id="chat" hidden>
+          <div class="chat-head">
+            <button class="link-btn" id="back" aria-label="Back to inbox">←</button>
+            <div>
+              <h2 id="customer-name"></h2>
+              <p id="customer-meta"></p>
+            </div>
+            <div style="flex:1"></div>
+            <button class="link-btn" id="toggle-status">Mark resolved</button>
+          </div>
+
+          <div class="messages" id="messages"></div>
+          <div class="typing" id="typing"></div>
+
+          <form class="composer" id="composer">
+            <textarea id="input" rows="1" placeholder="Write a reply…" maxlength="4000"></textarea>
+            <button class="send" id="send" type="submit">Send</button>
+          </form>
+        </div>
+
+        <div class="empty" id="no-selection">
+          Pick a conversation on the left to read it and reply.
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/thread.js"></script>
+  <script src="/js/admin.js"></script>
+</body>
+</html>
